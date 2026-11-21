@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-VERSION = 'moody-krea2-gguf-v3-modulation-fix'
+VERSION = 'moody-krea2-gguf-v4-result-fix'
 COMFY_DIR = Path(os.environ.get('COMFY_DIR', '/opt/ComfyUI'))
 MODEL_ROOT = Path(os.environ.get('MODEL_ROOT', '/models'))
 API = 'http://127.0.0.1:8188'
@@ -147,7 +147,8 @@ def call(path, payload=None, timeout=15):
         data=json.dumps(payload).encode() if payload is not None else None,
         headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.load(response)
+        raw = response.read()
+        return json.loads(raw) if raw.strip() else {}
 
 
 def ready():
@@ -155,9 +156,10 @@ def ready():
     if startup_error:
         raise RuntimeError(startup_error)
     if process is not None:
-        if process.poll() is not None:
-            raise RuntimeError('ComfyUI exited; restart the worker')
-        return
+        if process.poll() is None:
+            return
+        # A new user request may start a fresh engine; never retry a submitted job.
+        process = None
     try:
         phase = 'model_download_or_verification'
         ensure_models()
@@ -209,6 +211,7 @@ def generate(p):
                     raise RuntimeError('ComfyUI execution failed: ' + safe_text(detail))
                 images = item.get('outputs', {}).get('8', {}).get('images', [])
                 if images:
+                    phase = 'output_read'
                     image = images[0]
                     base = (COMFY_DIR / 'output').resolve()
                     file = (base / image.get('subfolder', '') / image['filename']).resolve()
@@ -218,7 +221,13 @@ def generate(p):
                         encoded = base64.b64encode(file.read_bytes()).decode()
                     finally:
                         file.unlink(missing_ok=True)
-                    call('/history', {'delete': [prompt_id]})
+                    phase = 'output_cleanup'
+                    try:
+                        call('/history', {'delete': [prompt_id]})
+                    except Exception as cleanup_error:
+                        # A housekeeping error must not discard an already generated image.
+                        print('History cleanup warning: ' + safe_text(cleanup_error), flush=True)
+                    phase = 'ready'
                     return {'image_base64': encoded, 'mime_type': 'image/png', 'mode': 'krea2_t2i',
                             'worker_version': VERSION, 'model': 'Moody Krea 2 Mix V4 Q4_K',
                             **{key: p[key] for key in ('width', 'height', 'seed', 'steps', 'cfg')}}
