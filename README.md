@@ -88,3 +88,13 @@ python runtime.py --check
 python -m unittest -v test_runtime.py
 python -m py_compile runtime.py handler.py
 ```
+
+## GGUF補助パラメーターの互換性修正 v3
+
+実GPUログで6144対3456のエラーを確認。配布GGUFのヘッダーでは
+`model.diffusion_model.last.modulation.lin` が形状[6144,2]、Q4_K形式でした。
+ComfyUIのSimpleModulationがこのパラメーターを直接加算するため、GGUF Linear用の展開経路を通りません。
+ビルド時に固定GGUFローダーへ限定パッチを適用し、この小さなパラメーターだけfloat32に展開します。
+大きなLinear重み、元のGGUF、生成寸法、推論設定は変更しません。
+CPUテストでは対象限定・二重適用防止・上流ソース変更時の停止を検証。修正後のGPU生成は未確認です。
+worker_version: moody-krea2-gguf-v3-modulation-fix
