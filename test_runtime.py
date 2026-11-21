@@ -57,6 +57,31 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn('?token=',json.dumps(d))
         self.assertIn('phase',d);self.assertIn('detail',d);self.assertIn('engine_log_tail',d)
 
+    def test_standalone_modulation_expanded_only_when_needed(self):
+        import textwrap
+        import patch_gguf
+        packed=SimpleNamespace(shape=(2,3456),tensor_shape=(2,6144))
+        dense=SimpleNamespace(shape=(2,6144))
+        for arch,key,quantized,expected in [('krea2','last.modulation.lin',True,dense),
+                    ('krea2','last.modulation.lin',False,packed),
+                    ('krea2','blocks.0.attn.wq.weight',True,packed),
+                    ('flux','last.modulation.lin',True,packed)]:
+            state={key:packed};calls=[]
+            def dequantize(value,dtype):
+                self.assertIs(value,packed);calls.append(dtype);return dense
+            env=dict(arch_str=arch,sd_key=key,state_dict=state,
+                     is_quantized=lambda _:quantized,dequantize_tensor=dequantize,
+                     torch=SimpleNamespace(float32='f32'))
+            exec(textwrap.dedent(patch_gguf.PATCH),env)
+            self.assertIs(state[key],expected)
+            self.assertEqual(len(calls),int(expected is dense))
+        source='before\n'+patch_gguf.ANCHOR+'after\n'
+        patched=patch_gguf.patch_source(source)
+        self.assertEqual(patch_gguf.patch_source(patched),patched)
+        with self.assertRaises(RuntimeError):patch_gguf.patch_source('unsupported loader')
+        docker=(runtime.HERE/'Dockerfile').read_text()
+        self.assertIn('RUN python /app/patch_gguf.py',docker)
+
     def test_model_manifest_is_pinned(self):
         m=runtime.load_manifest()['models'];self.assertEqual(len(m),3)
         for item in m:
