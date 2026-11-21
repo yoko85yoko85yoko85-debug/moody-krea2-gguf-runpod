@@ -1,0 +1,8 @@
+.git
+research
+__pycache__
+*.pyc
+models
+*.gguf
+*.safetensors
+*.zip
