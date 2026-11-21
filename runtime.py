@@ -1,6 +1,9 @@
 """Lazy ComfyUI runtime. Importing this file never starts GPU work or downloads."""
 import base64
 import copy
+import io
+import uuid
+import warnings
 from collections import deque
 import re
 import hashlib
@@ -16,7 +19,7 @@ import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-VERSION = 'moody-krea2-gguf-v4-result-fix'
+VERSION = 'moody-krea2-gguf-v5-i2i'
 COMFY_DIR = Path(os.environ.get('COMFY_DIR', '/opt/ComfyUI'))
 MODEL_ROOT = Path(os.environ.get('MODEL_ROOT', '/models'))
 API = 'http://127.0.0.1:8188'
@@ -61,7 +64,7 @@ def load_manifest():
 def validate(p):
     if not isinstance(p, dict):
         raise ValueError('input must be an object')
-    allowed = {'prompt', 'negative_prompt', 'width', 'height', 'seed', 'steps', 'cfg', 'diagnose'}
+    allowed = {'prompt', 'negative_prompt', 'width', 'height', 'seed', 'steps', 'cfg', 'diagnose', 'mode', 'image_base64', 'denoise'}
     if set(p) - allowed:
         raise ValueError('Unsupported input field')
     if p.get('diagnose') is True:
@@ -85,10 +88,44 @@ def validate(p):
     if type(cfg) not in (int, float) or not 0.0 <= cfg <= 10.0:
         raise ValueError('cfg must be between 0 and 10')
     out['cfg'] = cfg
+    mode = p.get('mode', 't2i')
+    if mode not in ('t2i', 'i2i'):
+        raise ValueError('mode must be t2i or i2i')
+    out['mode'] = mode
+    if mode == 'i2i':
+        denoise = p.get('denoise', 0.45)
+        if type(denoise) not in (int, float) or not 0.05 <= denoise <= 1:
+            raise ValueError('denoise must be between 0.05 and 1')
+        out['denoise'] = denoise
+        out['_source_png'] = normalize_source(p.get('image_base64'), out['width'], out['height'])
+    elif 'image_base64' in p or 'denoise' in p:
+        raise ValueError('Image and denoise require mode=i2i')
     return out
 
 
-def graph(p):
+def normalize_source(encoded, width, height):
+    from PIL import Image, ImageOps
+    if not isinstance(encoded, str) or not 1 <= len(encoded) <= 4_000_000:
+        raise ValueError('image_base64 must contain an image of at most 3 MB')
+    raw = base64.b64decode(encoded, validate=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', Image.DecompressionBombWarning)
+        with Image.open(io.BytesIO(raw)) as original:
+            if original.format not in ('PNG', 'JPEG', 'WEBP') or original.width * original.height > 20_000_000:
+                raise ValueError('Source must be PNG/JPEG/WebP and at most 20 million pixels')
+            original = ImageOps.exif_transpose(original)
+            rgba = original.convert('RGBA')
+            background = Image.new('RGB', rgba.size, 'black')
+            background.paste(rgba, mask=rgba.getchannel('A'))
+            scaled = ImageOps.contain(background, (width, height), Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (width, height), 'black')
+            canvas.paste(scaled, ((width-scaled.width)//2, (height-scaled.height)//2))
+    buffer = io.BytesIO()
+    canvas.save(buffer, format='PNG')
+    return buffer.getvalue()
+
+
+def graph(p, source_filename=None):
     g = copy.deepcopy(json.loads((HERE / 'workflow_api.json').read_text()))
     g['3']['inputs']['text'] = p['prompt']
     g['4']['inputs']['text'] = p['negative_prompt']
@@ -96,6 +133,14 @@ def graph(p):
         g['5']['inputs'][key] = p[key]
     for key in ('seed', 'steps', 'cfg'):
         g['6']['inputs'][key] = p[key]
+    if p.get('mode') == 'i2i':
+        if not source_filename or not re.fullmatch(r'frame_i2i_[a-f0-9]{32}\.png', source_filename):
+            raise ValueError('Internal source image filename is missing or invalid')
+        g.pop('5')
+        g['10'] = {'class_type': 'LoadImage', 'inputs': {'image': source_filename}}
+        g['11'] = {'class_type': 'VAEEncode', 'inputs': {'pixels': ['10', 0], 'vae': ['7', 0]}}
+        g['6']['inputs']['latent_image'] = ['11', 0]
+        g['6']['inputs']['denoise'] = p['denoise']
     return g
 
 
@@ -174,7 +219,8 @@ def ready():
                 raise RuntimeError('ComfyUI failed to start; see container logs')
             try:
                 info = call('/object_info')
-                missing = {node['class_type'] for node in graph(validate({'prompt': 'test'})).values()} - set(info)
+                missing = {node['class_type'] for node in graph(validate({'prompt': 'test'})).values()} | {'LoadImage', 'VAEEncode'}
+                missing -= set(info)
                 if missing:
                     raise RuntimeError('Required nodes missing: ' + ', '.join(sorted(missing)))
                 phase = 'ready'
@@ -190,10 +236,25 @@ def ready():
 
 
 def generate(p):
+    source = None
+    try:
+        if p.get('mode') == 'i2i':
+            ready()
+            folder = COMFY_DIR / 'input'
+            folder.mkdir(parents=True, exist_ok=True)
+            source = folder / ('frame_i2i_' + uuid.uuid4().hex + '.png')
+            source.write_bytes(p['_source_png'])
+        return execute(p, source.name if source else None)
+    finally:
+        if source is not None:
+            source.unlink(missing_ok=True)
+
+
+def execute(p, source_filename=None):
     global phase
     ready()
     phase = 'workflow_submission'
-    response = call('/prompt', {'prompt': graph(p)})
+    response = call('/prompt', {'prompt': graph(p, source_filename)})
     if response.get('node_errors') or not response.get('prompt_id'):
         raise RuntimeError('Workflow rejected: ' + json.dumps(response.get('node_errors', {})))
     phase = 'inference'
@@ -228,7 +289,8 @@ def generate(p):
                         # A housekeeping error must not discard an already generated image.
                         print('History cleanup warning: ' + safe_text(cleanup_error), flush=True)
                     phase = 'ready'
-                    return {'image_base64': encoded, 'mime_type': 'image/png', 'mode': 'krea2_t2i',
+                    return {'image_base64': encoded, 'mime_type': 'image/png', 'mode': 'krea2_i2i' if p.get('mode') == 'i2i' else 'krea2_t2i',
+                            **({'denoise': p['denoise']} if p.get('mode') == 'i2i' else {}),
                             'worker_version': VERSION, 'model': 'Moody Krea 2 Mix V4 Q4_K',
                             **{key: p[key] for key in ('width', 'height', 'seed', 'steps', 'cfg')}}
             time.sleep(1)
