@@ -9,7 +9,7 @@ GPU Pod・Jupyter・手動の巨大イメージ書き出しは使いません。
 - Dockerfile / handler / ComfyUI APIワークフロー / モデル取得・容量確認処理を作成済み。
 - CPU上の設定・入力検証・API応答・出力後の片付け・容量不足時の停止テスト：6件成功。
 - Dockerイメージの実ビルド、依存パッケージの実インストール、GGUFの実ロード、GPU推論は未確認。
-- 初期版はテキストから画像生成のみ。画像編集・LoRA・専用アプリは未実装。
+- T2Iに加え、元画像をVAEEncodeして再描画するI2I（v5）に対応。専用の指示編集LoRAや画像参照トークンは使用しません。
 - steps=12 / CFG=1 / euler / simple は最初の動作確認用の仮設定。Moody V4での最適値は未検証。
 - 4090・24GBでの動作、速度、画質や最大解像度は未検証。
 
@@ -78,7 +78,7 @@ RunPodの請求仕様：https://docs.runpod.io/serverless/pricing
 
 返却：image_base64（PNG）、width、height、seed、steps、cfg、worker_version。
 初回は3モデルの取得・検証・ロードが入ります。ジョブを自動再送しません。
-指定できる入力はprompt、negative_prompt、width、height、seed、steps、cfg、diagnoseだけです。
+指定できる入力はprompt、negative_prompt、width、height、seed、steps、cfg、diagnose、mode、image_base64、denoiseです。
 ユーザー指定のワークフローや任意ファイルパスは受け付けません。
 
 ## GPU不要のローカル確認
@@ -105,3 +105,13 @@ ComfyUIのPOST /historyは成功時に空のHTTP 200を返します。これをJ
 生成が完了しても後処理で失敗していました。空の成功応答を受け付け、履歴削除失敗で生成済み画像を失わないよう変更。
 出力読込・後処理のphaseを分離。終了済みエンジンは次の新規リクエスト時に作り直し、同じ生成を自動再送しません。
 worker_version: moody-krea2-gguf-v4-result-fix
+
+## I2I（v5）
+
+mode=i2i、image_base64（JPEG/PNG/WebP、最大4,000,000文字、2000万画素以下）、denoise（0.05〜1、初期値0.45）を追加。
+元画像はEXIF回転を反映しRGB化、透明部分は黒、比率を保って指定サイズの黒いキャンバスに収めます。
+`LoadImage → VAEEncode → KSampler(latent_image, denoise) → VAEDecode → SaveImage`を使用。
+生成後・失敗時とも入力一時ファイルを削除します。T2Iでは元のEmptyLatentImageとdenoise=1の経路を維持。
+これは元画像からの再描画であり、Identity Edit等の専用LoRAによる指示編集とは異なります。
+CPUテスト13件成功。実GPUでのI2Iの画質・VRAM・VAE Encode動作は未確認です。
+worker_version: moody-krea2-gguf-v5-i2i
