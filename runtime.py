@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-VERSION = 'moody-krea2-gguf-v2-diagnostics'
+VERSION = 'moody-krea2-gguf-v3-modulation-fix'
 COMFY_DIR = Path(os.environ.get('COMFY_DIR', '/opt/ComfyUI'))
 MODEL_ROOT = Path(os.environ.get('MODEL_ROOT', '/models'))
 API = 'http://127.0.0.1:8188'
