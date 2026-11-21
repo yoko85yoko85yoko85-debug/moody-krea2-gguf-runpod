@@ -49,6 +49,14 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(out['image_base64'],'cG5nLXRlc3Q=');self.assertFalse(file.exists())
             self.assertIn(('/history',{'delete':['job-1']}),calls)
 
+    def test_diagnostic_error_redacts_secrets(self):
+        import os
+        with patch.dict(os.environ, {'HF_TOKEN':'hf_examplePrivateToken123', 'RUNPOD_API_KEY':'rpa_examplePrivateKey123'}):
+            d=runtime.diagnostic_error(RuntimeError('HF hf_examplePrivateToken123 / rpa_examplePrivateKey123 / https://example.com/?token=secret'))
+        self.assertNotIn('examplePrivate',json.dumps(d))
+        self.assertNotIn('?token=',json.dumps(d))
+        self.assertIn('phase',d);self.assertIn('detail',d);self.assertIn('engine_log_tail',d)
+
     def test_model_manifest_is_pinned(self):
         m=runtime.load_manifest()['models'];self.assertEqual(len(m),3)
         for item in m:
