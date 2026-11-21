@@ -82,6 +82,27 @@ class ContractTests(unittest.TestCase):
         docker=(runtime.HERE/'Dockerfile').read_text()
         self.assertIn('RUN python /app/patch_gguf.py',docker)
 
+    def test_http_empty_success_response(self):
+        import io
+        with patch.object(runtime.urllib.request,'urlopen',return_value=io.BytesIO(b'')):
+            self.assertEqual(runtime.call('/history',{'delete':['job-1']}),{})
+        with patch.object(runtime.urllib.request,'urlopen',return_value=io.BytesIO(b'{"ok":true}')):
+            self.assertEqual(runtime.call('/history/job-1'),{'ok':True})
+        with patch.object(runtime.urllib.request,'urlopen',return_value=io.BytesIO(b'invalid')):
+            with self.assertRaises(ValueError):runtime.call('/history/job-1')
+
+    def test_output_survives_history_cleanup_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/'output').mkdir();file=root/'output'/'test.png';file.write_bytes(b'png-test')
+            def call(path,payload=None,**kw):
+                if path=='/prompt':return {'prompt_id':'job-1'}
+                if path=='/history/job-1':return {'job-1':{'outputs':{'8':{'images':[{'filename':'test.png'}]}}}}
+                raise ValueError('simulated housekeeping failure')
+            with patch.object(runtime,'COMFY_DIR',root),patch.object(runtime,'ready'),patch.object(runtime,'call',side_effect=call),patch.object(runtime,'process',SimpleNamespace(poll=lambda:None)):
+                out=runtime.generate(runtime.validate({'prompt':'A mug.'}))
+            self.assertEqual(out['image_base64'],'cG5nLXRlc3Q=')
+            self.assertFalse(file.exists())
+
     def test_model_manifest_is_pinned(self):
         m=runtime.load_manifest()['models'];self.assertEqual(len(m),3)
         for item in m:
