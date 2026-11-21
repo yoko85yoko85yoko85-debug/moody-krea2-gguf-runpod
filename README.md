@@ -98,3 +98,10 @@ ComfyUIのSimpleModulationがこのパラメーターを直接加算するため
 大きなLinear重み、元のGGUF、生成寸法、推論設定は変更しません。
 CPUテストでは対象限定・二重適用防止・上流ソース変更時の停止を検証。修正後のGPU生成は未確認です。
 worker_version: moody-krea2-gguf-v3-modulation-fix
+
+## 結果返却の修正 v4
+
+ComfyUIのPOST /historyは成功時に空のHTTP 200を返します。これをJSONとして解析していたため、
+生成が完了しても後処理で失敗していました。空の成功応答を受け付け、履歴削除失敗で生成済み画像を失わないよう変更。
+出力読込・後処理のphaseを分離。終了済みエンジンは次の新規リクエスト時に作り直し、同じ生成を自動再送しません。
+worker_version: moody-krea2-gguf-v4-result-fix
