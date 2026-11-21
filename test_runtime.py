@@ -103,6 +103,55 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(out['image_base64'],'cG5nLXRlc3Q=')
             self.assertFalse(file.exists())
 
+    def source_input(self, **changes):
+        import io,base64
+        from PIL import Image
+        image=Image.new('RGB',(100,200),'red');buf=io.BytesIO();image.save(buf,format='PNG')
+        return {'prompt':'A watercolor painting of the subject.', 'mode':'i2i', 'image_base64':base64.b64encode(buf.getvalue()).decode(), **changes}
+
+    def test_i2i_padding_and_graph(self):
+        import io
+        from PIL import Image
+        p=runtime.validate(self.source_input(denoise=.45))
+        image=Image.open(io.BytesIO(p['_source_png']))
+        self.assertEqual(image.size,(768,768))
+        self.assertEqual(image.getpixel((0,384)),(0,0,0))
+        self.assertEqual(image.getpixel((384,384)),(255,0,0))
+        self.assertEqual(image.getpixel((191,384)),(0,0,0))
+        self.assertEqual(image.getpixel((192,384)),(255,0,0))
+        g=runtime.graph(p,'frame_i2i_'+'a'*32+'.png')
+        self.assertNotIn('5',g)
+        self.assertEqual(g['10']['class_type'],'LoadImage')
+        self.assertEqual(g['11']['inputs'],{'pixels':['10',0],'vae':['7',0]})
+        self.assertEqual(g['6']['inputs']['latent_image'],['11',0])
+        self.assertEqual(g['6']['inputs']['denoise'],.45)
+        with self.assertRaises(ValueError):runtime.graph(p,'../escape.png')
+        t2i=runtime.graph(runtime.validate({'prompt':'A mug.'}))
+        self.assertEqual(t2i['6']['inputs']['latent_image'],['5',0])
+        self.assertEqual(t2i['6']['inputs']['denoise'],1)
+
+    def test_i2i_validation_before_generation(self):
+        for changes in [{'image_base64':''},{'image_base64':'bad!'}, {'denoise':0},{'denoise':1.1},{'denoise':True},{'denoise':float('nan')},{'mode':'unknown'}]:
+            with self.assertRaises(Exception):runtime.validate(self.source_input(**changes))
+        with self.assertRaises(ValueError):runtime.validate({'prompt':'x','image_base64':'abcd'})
+        with self.assertRaises(ValueError):runtime.validate({'prompt':'x','denoise':.5})
+
+    def test_source_file_cleanup_after_success_and_failure(self):
+        p=runtime.validate(self.source_input())
+        for fail in (False,True):
+            with tempfile.TemporaryDirectory() as temp:
+                root=Path(temp)
+                def execute(params,filename):
+                    file=root/'input'/filename
+                    self.assertEqual(file.read_bytes(),p['_source_png'])
+                    if fail:raise RuntimeError('simulated generation failure')
+                    return {'mode':'krea2_i2i'}
+                with patch.object(runtime,'COMFY_DIR',root),patch.object(runtime,'ready'),patch.object(runtime,'execute',side_effect=execute):
+                    if fail:
+                        with self.assertRaises(RuntimeError):runtime.generate(p)
+                    else:self.assertEqual(runtime.generate(p)['mode'],'krea2_i2i')
+                self.assertEqual(list((root/'input').iterdir()),[])
+
     def test_model_manifest_is_pinned(self):
         m=runtime.load_manifest()['models'];self.assertEqual(len(m),3)
         for item in m:
