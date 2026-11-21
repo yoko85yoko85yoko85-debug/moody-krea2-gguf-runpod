@@ -7,10 +7,9 @@ def handler(job):
         with runtime.LOCK:
             return runtime.diagnose() if p.get('diagnose') else runtime.generate(p)
     except Exception as error:
-        # Never return credentials, local paths, or raw HTTP exceptions to API clients.
-        print('Generation failed: ' + type(error).__name__, flush=True)
-        return {'error': 'Krea2処理に失敗しました。入力・モデル取得権限・ディスク容量とWorkerログを確認してください。',
-                'error_type': type(error).__name__, 'worker_version': runtime.VERSION}
+        detail = runtime.diagnostic_error(error)
+        print('Generation failed: ' + runtime.safe_text(detail), flush=True)
+        return {'error': 'Krea2処理に失敗しました。detail・phase・engine_log_tailを確認してください。', **detail}
 
 
 if __name__ == '__main__':
