@@ -1,6 +1,8 @@
 """Lazy ComfyUI runtime. Importing this file never starts GPU work or downloads."""
 import base64
 import copy
+from collections import deque
+import re
 import hashlib
 import json
 import os
@@ -14,13 +16,42 @@ import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-VERSION = 'moody-krea2-gguf-v1'
+VERSION = 'moody-krea2-gguf-v2-diagnostics'
 COMFY_DIR = Path(os.environ.get('COMFY_DIR', '/opt/ComfyUI'))
 MODEL_ROOT = Path(os.environ.get('MODEL_ROOT', '/models'))
 API = 'http://127.0.0.1:8188'
 LOCK = threading.Lock()
 process = None
 startup_error = None
+phase = 'registered'
+engine_log = deque(maxlen=100)
+
+
+def safe_text(value):
+    text = str(value)
+    for key, secret in os.environ.items():
+        if any(part in key.upper() for part in ('TOKEN', 'SECRET', 'PASSWORD', 'API_KEY', 'AUTHORIZATION')) and len(secret) >= 4:
+            text = text.replace(secret, '[redacted]')
+    text = re.sub(r'(?:hf_|rpa_|ghp_)[A-Za-z0-9_-]+', '[redacted-token]', text)
+    text = re.sub(r'(?i)(Bearer\s+)[^\s]+', r'\1[redacted]', text)
+    text = re.sub(r'https?://[^\s]+', '[url omitted]', text)
+    return text[-12000:]
+
+
+def capture_engine(stream):
+    try:
+        for line in stream:
+            cleaned = safe_text(line.rstrip())
+            engine_log.append(cleaned)
+            print('[ComfyUI] ' + cleaned, flush=True)
+    finally:
+        stream.close()
+
+
+def diagnostic_error(error):
+    return {'error_type': type(error).__name__, 'phase': phase,
+            'detail': safe_text(error), 'engine_log_tail': safe_text('\n'.join(list(engine_log)[-40:])),
+            'worker_version': VERSION}
 
 
 def load_manifest():
@@ -120,7 +151,7 @@ def call(path, payload=None, timeout=15):
 
 
 def ready():
-    global process, startup_error
+    global process, startup_error, phase
     if startup_error:
         raise RuntimeError(startup_error)
     if process is not None:
@@ -128,9 +159,13 @@ def ready():
             raise RuntimeError('ComfyUI exited; restart the worker')
         return
     try:
+        phase = 'model_download_or_verification'
         ensure_models()
+        phase = 'comfy_startup'
         process = subprocess.Popen([sys.executable, str(COMFY_DIR / 'main.py'), '--listen', '127.0.0.1',
-                    '--port', '8188', '--disable-auto-launch', '--disable-metadata'], cwd=COMFY_DIR)
+                    '--port', '8188', '--disable-auto-launch', '--disable-metadata'], cwd=COMFY_DIR,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+        threading.Thread(target=capture_engine, args=(process.stdout,), daemon=True).start()
         deadline = time.monotonic() + 240
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -140,6 +175,7 @@ def ready():
                 missing = {node['class_type'] for node in graph(validate({'prompt': 'test'})).values()} - set(info)
                 if missing:
                     raise RuntimeError('Required nodes missing: ' + ', '.join(sorted(missing)))
+                phase = 'ready'
                 return
             except (urllib.error.URLError, TimeoutError):
                 time.sleep(1)
@@ -152,10 +188,13 @@ def ready():
 
 
 def generate(p):
+    global phase
     ready()
+    phase = 'workflow_submission'
     response = call('/prompt', {'prompt': graph(p)})
     if response.get('node_errors') or not response.get('prompt_id'):
         raise RuntimeError('Workflow rejected: ' + json.dumps(response.get('node_errors', {})))
+    phase = 'inference'
     prompt_id = response['prompt_id']
     deadline = time.monotonic() + 900
     try:
@@ -165,7 +204,9 @@ def generate(p):
             item = call('/history/' + prompt_id).get(prompt_id)
             if item:
                 if item.get('status', {}).get('status_str') == 'error':
-                    raise RuntimeError('ComfyUI execution failed; see container logs')
+                    messages = item.get('status', {}).get('messages', [])
+                    detail = next((m[1].get('exception_message', '') for m in reversed(messages) if isinstance(m, list) and len(m) > 1 and m[0] == 'execution_error' and isinstance(m[1], dict)), '')
+                    raise RuntimeError('ComfyUI execution failed: ' + safe_text(detail))
                 images = item.get('outputs', {}).get('8', {}).get('images', [])
                 if images:
                     image = images[0]
